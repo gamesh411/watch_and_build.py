@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
-import time
 import argparse
+import diff_match_patch
+import difflib
 import subprocess
+import time
+import sys
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from datetime import datetime
@@ -13,11 +16,10 @@ class ChangeHandler(FileSystemEventHandler):
         self.build_script = build_script
         self.run_script = run_script
         self.path_suffixes = path_suffixes
+        self.last_test_output = None
 
-    def on_any_event(self, event):
+    def on_closed(self, event):
         if event.is_directory:
-            return
-        if event.event_type != "modified":
             return
         print(f"\nChange detected: {event.src_path}")
         if not any(event.src_path.endswith(suffix) for suffix in self.path_suffixes):
@@ -26,6 +28,45 @@ class ChangeHandler(FileSystemEventHandler):
             )
             return
         self.run_build_and_test()
+
+    def highlight_line_diff(self, last_test_output, current_test_output):
+        if last_test_output is None:
+            return current_test_output
+
+        diff = difflib.ndiff(
+            last_test_output.splitlines(keepends=True),
+            current_test_output.splitlines(keepends=True),
+        )
+
+        colored_diff = []
+        for line in diff:
+            if line.startswith("+ "):
+                colored_diff.append(f"\033[92m{line[2:]}\033[0m")
+            elif line.startswith("- "):
+                colored_diff.append(f"\033[91m{line[2:]}\033[0m")
+            elif line.startswith("? "):
+                pass
+            else:
+                colored_diff.append(line)
+        return "".join(colored_diff)
+
+    def highlight_char_diff(self, last_test_output, current_test_output):
+        if last_test_output is None:
+            return current_test_output
+
+        dmp = diff_match_patch.diff_match_patch()
+        diffs = dmp.diff_main(last_test_output, current_test_output)
+        dmp.diff_cleanupSemantic(diffs)
+
+        colored_diff = []
+        for diff in diffs:
+            if diff[0] == dmp.DIFF_INSERT:
+                colored_diff.append(f"\033[92m{diff[1]}\033[0m")
+            elif diff[0] == dmp.DIFF_DELETE:
+                colored_diff.append(f"\033[91m{diff[1]}\033[0m")
+            else:
+                colored_diff.append(diff[1])
+        return "".join(colored_diff)
 
     def run_build_and_test(self):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -50,7 +91,10 @@ class ChangeHandler(FileSystemEventHandler):
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            print(f"Test output:\n{test_output.stdout}")
+            print(
+                f"Test output:\n{self.highlight_char_diff(self.last_test_output, test_output.stdout)}"
+            )
+            self.last_test_output = test_output.stdout
 
         except subprocess.CalledProcessError as e:
             if e.cmd == self.build_script:
@@ -65,11 +109,24 @@ def watch_directory(path, path_suffixes, build_script, run_script):
     observer.schedule(event_handler, path, recursive=True)
     observer.start()
 
-    try:
-        while True:
+    print("Press Ctrl+C to trigger a build manually...")
+
+    double_interrupted = False
+    while not double_interrupted:
+        try:
             time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
+        except KeyboardInterrupt:
+            try:
+                print("Rebuilding...")
+                event_handler.run_build_and_test()
+                print("Press Ctrl+C again withing 1 second to stop...", end="")
+                sys.stdout.flush()
+                time.sleep(1)
+                print("reset")
+            except KeyboardInterrupt:
+                double_interrupted = True
+                observer.stop()
+
     observer.join()
 
 
@@ -94,6 +151,5 @@ if __name__ == "__main__":
     print(f"Build script: {args.build_script}")
     print(f"Run script: {args.run_script}")
     print(f"Watching only suffixes: {args.suffixes}")
-    print("Press Ctrl+C to stop...")
 
     watch_directory(args.path, args.suffixes, args.build_script, args.run_script)
